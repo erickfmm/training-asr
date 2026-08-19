@@ -4,6 +4,9 @@ Common Voice es, optimizado para Tesla P40 (sm_61, 24 GB, fp32).
 
 Características:
   - Optimizador Turbo-Muon (híbrido con AdamW) o AdamW puro (--optimizer).
+  - Grad accumulation (--grad-accum-steps) + protección inf/nan: descarta la
+    ventana afectada, reduce el LR a la mitad (permanente) y reintenta; tras
+    3 fallos consecutivos guarda checkpoint de emergencia y detiene el run.
   - Logging por step en CSV (loss, lr real, norma del gradiente, throughput, mem).
   - Checkpoints rolling cada 500 steps (conserva los últimos 3) + best-3 por WER.
   - Sincronización opcional con Weights & Biases (--wandb).
@@ -312,6 +315,14 @@ class WarmupCosine:
         self.base = base_lrs
         self.min_frac = min_frac
 
+    def scale_base(self, factor: float):
+        """Multiplica los base LR de forma permanente y los aplica ya a los
+        param_groups (sobrevive a los próximos step(), que recalculan desde base)."""
+        for name in self.base:
+            self.base[name] *= factor
+        set_lrs(self.optimizers, self.base)
+        return get_lrs(self.optimizers)
+
     def step(self, step: int):
         for name in self.base:
             if step < self.warmup:
@@ -325,8 +336,18 @@ class WarmupCosine:
 
 
 # ----------------------------------------------------------------------------
-# Gradiente total + clipping
+# Gradiente total + clipping + protección inf/nan
 # ----------------------------------------------------------------------------
+def grads_have_inf_nan(model) -> Tuple[bool, str]:
+    """True si algún gradiente de un parámetro entrenable tiene inf/nan.
+    Retorna también el nombre del primer parámetro ofensor (para logging)."""
+    for name, p in model.named_parameters():
+        if p.requires_grad and p.grad is not None:
+            if not torch.isfinite(p.grad).all().item():
+                return True, name
+    return False, ""
+
+
 def compute_grad_norm_and_clip(model, max_norm: float) -> Tuple[float, float]:
     total = 0.0
     for p in model.parameters():
@@ -398,6 +419,7 @@ def save_checkpoint(
     step: int,
     best_wer: float,
     args,
+    extra: dict | None = None,
 ):
     path.parent.mkdir(parents=True, exist_ok=True)
     ckpt = {
@@ -407,6 +429,8 @@ def save_checkpoint(
         "best_wer": best_wer,
         "args": vars(args),
     }
+    if extra:
+        ckpt.update(extra)
     torch.save(ckpt, str(path))
     log.info("checkpoint guardado: %s (step=%d)", path.name, step)
 
@@ -568,6 +592,10 @@ def parse_args():
     p.add_argument("--warmup-steps", type=int, default=1000)
     p.add_argument("--max-steps", type=int, default=20000)
     p.add_argument("--grad-clip", type=float, default=5.0)
+    p.add_argument("--grad-accum-steps", type=int, default=1,
+                   help="micro-batches acumulados por step del optimizador")
+    p.add_argument("--max-grad-retries", type=int, default=3,
+                   help="fallos inf/nan consecutivos antes del stop de emergencia")
     p.add_argument("--rnnt-warm-step", type=int, default=2000)
     p.add_argument("--simple-loss-scale", type=float, default=0.5)
     p.add_argument("--prune-range", type=int, default=5)
@@ -704,13 +732,17 @@ def main():
         "s_scale", "p_scale", "lr_muon", "lr_adamw",
         "grad_norm", "clip_ratio", "frames", "batch_size",
         "tok_per_sec", "batches_per_sec", "mem_alloc_gb", "mem_reserved_gb",
-        "elapsed_sec",
+        "elapsed_sec", "nan_failures", "lr_scale",
     ])
     val_log = CSVLogger(str(out_dir / "val_log.csv"), [
         "step", "val_loss", "wer",
     ])
 
     # ---- bucle ----
+    accum = max(1, args.grad_accum_steps)
+    nan_failures = 0  # fallos inf/nan consecutivos (global; step exitoso reinicia)
+    lr_halvings = 0
+
     rng = np.random.default_rng(args.seed)
     epoch = 0
     step = start_step
@@ -718,78 +750,150 @@ def main():
     last_log = time.time()
     last_frames = 0
 
-    log.info("Iniciando entrenamiento: %d steps, batch~%.0fs", args.max_steps, args.batch_seconds)
+    log.info("Iniciando entrenamiento: %d steps, batch~%.0fs, grad_accum=%d",
+             args.max_steps, args.batch_seconds, accum)
 
     while step < args.max_steps:
         epoch += 1
         batches = make_batches_by_duration(train_ds, args.batch_seconds, shuffle=True, rng=rng)
-        for batch_idx in batches:
+        # ventanas de `accum` micro-batches (la última puede quedar corta)
+        windows = [batches[i : i + accum] for i in range(0, len(batches), accum)]
+        for window in windows:
             if step >= args.max_steps:
                 break
-            batch = [train_ds[j] for j in batch_idx]
-            try:
-                x, lens, texts = collate(batch, fbank)
-            except Exception as e:
-                log.warning("collate falló: %s", e)
+
+            # ---- collate de los micro-batches (una sola vez por ventana) ----
+            micros = []
+            skip = False
+            for batch_idx in window:
+                batch = [train_ds[j] for j in batch_idx]
+                try:
+                    x, lens, texts = collate(batch, fbank)
+                except Exception as e:
+                    log.warning("collate falló: %s", e)
+                    skip = True
+                    break
+                micros.append((x, lens, texts, len(batch_idx)))
+            if skip or not micros:
                 continue
-            x = x.to(device, non_blocking=True)
-            lens = lens.to(device, non_blocking=True)
-            texts = [normalize_text(t) for t in texts]
+            micros = [
+                (x.to(device, non_blocking=True),
+                 lens.to(device, non_blocking=True),
+                 [normalize_text(t) for t in texts], bs)
+                for x, lens, texts, bs in micros
+            ]
 
-            # forward + loss
-            for opt in optimizers:
-                opt[1].zero_grad(set_to_none=True)
-            outputs = model(
-                x=x, x_lens=lens, source_texts=texts, target_texts=texts,
-                prune_range=args.prune_range, am_scale=args.am_scale,
-                lm_scale=args.lm_scale,
-                forward_attention_decoder=False, forward_s2t_alignment=False,
-                return_dict=True,
-            )
-            loss, simple, pruned, s_scale, p_scale = compute_loss(
-                outputs, step, args.rnnt_warm_step, args.simple_loss_scale
-            )
-            nf = (lens // 4).sum().item()
-            loss = loss / max(1, nf)  # normalización por frame para backprop estable
+            # ---- intentos con protección inf/nan (misma ventana hasta éxito) ----
+            while True:
+                for opt in optimizers:
+                    opt[1].zero_grad(set_to_none=True)
 
-            loss.backward()
+                bad_loss = False
+                loss_sum = simple_sum = pruned_sum = 0.0
+                nf_total = bs_total = 0
+                for x, lens, texts, bs in micros:
+                    outputs = model(
+                        x=x, x_lens=lens, source_texts=texts, target_texts=texts,
+                        prune_range=args.prune_range, am_scale=args.am_scale,
+                        lm_scale=args.lm_scale,
+                        forward_attention_decoder=False, forward_s2t_alignment=False,
+                        return_dict=True,
+                    )
+                    loss, simple, pruned, s_scale, p_scale = compute_loss(
+                        outputs, step, args.rnnt_warm_step, args.simple_loss_scale
+                    )
+                    nf = (lens // 4).sum().item()
+                    if not torch.isfinite(loss).all().item():
+                        bad_loss = True
+                        log.warning("step %d: loss no finita (%.4g), ventana descartada",
+                                    step + 1, float(loss.item()))
+                        break
+                    # normalización por frame + escalado por acumulación
+                    (loss / max(1, nf) / len(micros)).backward()
+                    loss_sum += float(loss.item()) / max(1, nf)
+                    simple_sum += float(simple.item()) / max(1, nf)
+                    pruned_sum += float(pruned.item()) / max(1, nf)
+                    nf_total += nf
+                    bs_total += bs
 
-            grad_norm, clip_ratio = compute_grad_norm_and_clip(model, args.grad_clip)
-            lrs = scheduler.step(step)
-            for _, opt in optimizers:
-                opt.step()
+                if bad_loss:
+                    grad_bad, bad_name = True, "loss"
+                else:
+                    grad_bad, bad_name = grads_have_inf_nan(model)
 
-            step += 1
-            now = time.time()
-            dt = now - last_log
-            if step % args.log_every == 0 or step == 1:
-                mem_a = torch.cuda.memory_allocated() / 1e9 if device.type == "cuda" else 0
-                mem_r = torch.cuda.memory_reserved() / 1e9 if device.type == "cuda" else 0
-                fps = (step - start_step) / (now - t0)
-                row = {
-                    "step": step, "epoch": epoch,
-                    "loss": float(loss.item()), "simple_loss": float(simple.item()) / max(1, nf),
-                    "pruned_loss": float(pruned.item()) / max(1, nf),
-                    "s_scale": s_scale, "p_scale": p_scale,
-                    "lr_muon": lrs.get("turbo_muon", float("nan")),
-                    "lr_adamw": lrs.get("adamw", float("nan")),
-                    "grad_norm": grad_norm, "clip_ratio": clip_ratio,
-                    "frames": nf, "batch_size": len(batch_idx),
-                    "tok_per_sec": 0.0,
-                    "batches_per_sec": fps,
-                    "mem_alloc_gb": mem_a, "mem_reserved_gb": mem_r,
-                    "elapsed_sec": now - t0,
-                }
-                train_log.log(row)
-                if wandb_run:
-                    wandb_run.log(row, step=step)
-                log.info(
-                    "step %d | loss %.4f | lr_m %.5f lr_a %.5f | gn %.2f | %.0f batches/s | %.1fGB",
-                    step, float(loss.item()),
-                    row["lr_muon"], row["lr_adamw"], grad_norm, fps, mem_a,
-                )
-                last_log = now
-                last_frames = nf
+                if grad_bad:
+                    # descartar grads contaminados, halving permanente, reintentar
+                    for opt in optimizers:
+                        opt[1].zero_grad(set_to_none=True)
+                    nan_failures += 1
+                    lr_halvings += 1
+                    lrs = scheduler.scale_base(0.5)
+                    log.warning(
+                        "inf/nan en '%s' | fallo consecutivo %d/%d | lr_scale %.4f | lrs %s",
+                        bad_name, nan_failures, args.max_grad_retries,
+                        0.5 ** lr_halvings, lrs,
+                    )
+                    if nan_failures >= args.max_grad_retries:
+                        em_path = ckpt_dir / f"emergency_step-{step:07d}.pt"
+                        save_checkpoint(
+                            em_path, model, optimizers, scheduler, step, best_wer, args,
+                            extra={"emergency": True, "lr_halvings": lr_halvings,
+                                   "nan_failures": nan_failures},
+                        )
+                        train_log.close()
+                        val_log.close()
+                        if wandb_run:
+                            wandb_run.finish(exit_code=1)
+                        log.error("%d fallos consecutivos con inf/nan. "
+                                  "Stop de emergencia: %s", nan_failures, em_path)
+                        sys.exit(1)
+                    continue  # reintentar la misma ventana con LR reducido
+
+                # ---- update (ventana limpia) ----
+                grad_norm, clip_ratio = compute_grad_norm_and_clip(model, args.grad_clip)
+                lrs = scheduler.step(step)
+                for _, opt in optimizers:
+                    opt.step()
+
+                nan_failures = 0
+                step += 1
+                n_micros = len(micros)
+                win_loss = loss_sum / n_micros
+                win_simple = simple_sum / n_micros
+                win_pruned = pruned_sum / n_micros
+                now = time.time()
+                dt = now - last_log
+                if step % args.log_every == 0 or step == 1:
+                    mem_a = torch.cuda.memory_allocated() / 1e9 if device.type == "cuda" else 0
+                    mem_r = torch.cuda.memory_reserved() / 1e9 if device.type == "cuda" else 0
+                    fps = (step - start_step) / (now - t0)
+                    row = {
+                        "step": step, "epoch": epoch,
+                        "loss": win_loss, "simple_loss": win_simple,
+                        "pruned_loss": win_pruned,
+                        "s_scale": s_scale, "p_scale": p_scale,
+                        "lr_muon": lrs.get("turbo_muon", float("nan")),
+                        "lr_adamw": lrs.get("adamw", float("nan")),
+                        "grad_norm": grad_norm, "clip_ratio": clip_ratio,
+                        "frames": nf_total, "batch_size": bs_total,
+                        "tok_per_sec": 0.0,
+                        "batches_per_sec": fps,
+                        "mem_alloc_gb": mem_a, "mem_reserved_gb": mem_r,
+                        "elapsed_sec": now - t0,
+                        "nan_failures": nan_failures,
+                        "lr_scale": 0.5 ** lr_halvings,
+                    }
+                    train_log.log(row)
+                    if wandb_run:
+                        wandb_run.log(row, step=step)
+                    log.info(
+                        "step %d | loss %.4f | lr_m %.5f lr_a %.5f | gn %.2f | %.0f batches/s | %.1fGB",
+                        step, win_loss,
+                        row["lr_muon"], row["lr_adamw"], grad_norm, fps, mem_a,
+                    )
+                    last_log = now
+                    last_frames = nf_total
+                break  # ventana completada con éxito
 
             # ---- checkpoint rolling ----
             if step % args.rolling_every == 0:
