@@ -4,6 +4,8 @@ Fine-tuning ASR en español sobre el modelo **Auden TTA** ([`AudenAI/auden-tta-m
 
 Optimizador **Turbo-Muon** (con AdamW de respaldo) o AdamW puro. Logging por step en CSV, checkpoints best-3 + rolling cada 500 steps, y sincronización opcional con **Weights & Biases**.
 
+Incluye **grad accumulation** y un sistema de **estabilidad de entrenamiento** en tres capas (inf/nan, spike guard estilo ZClip con rollback, y clip adaptativo) para evitar divergencias — ver [§ 9](#9-estabilidad-del-entrenamiento).
+
 ---
 
 ## 1. Requisitos
@@ -90,7 +92,7 @@ python trainer.py ... --wandb --wandb-project mi-proyecto --wandb-run-name exp-0
 | Flag | Default | Descripción |
 |---|---|---|
 | `--optimizer` | `turbo_muon` | `turbo_muon` o `adamw` |
-| `--lr-muon` | `0.02` | LR para TurboMuon (params 2D) |
+| `--lr-muon` | `2e-3` | LR para TurboMuon (params 2D) |
 | `--lr-adamw` | `3e-4` | LR para AdamW (params 1D/3D) |
 | `--max-steps` | `20000` | steps totales |
 | `--warmup-steps` | `1000` | warmup lineal |
@@ -99,8 +101,35 @@ python trainer.py ... --wandb --wandb-project mi-proyecto --wandb-run-name exp-0
 | `--rolling-keep` | `3` | conservar últimos 3 rolling (borra anteriores) |
 | `--val-every` | `500` | validación + WER cada N steps |
 | `--val-samples` | `1000` | clips de test para WER periódico |
-| `--grad-clip` | `5.0` | clip de gradiente |
+| `--grad-clip` | `5.0` | clip de gradiente fijo |
 | `--resume` | auto | checkpoint a resumir (auto desde último rolling) |
+
+### Parámetros de estabilidad
+
+#### Grad accumulation & protección inf/nan
+
+| Flag | Default | Descripción |
+|---|---|---|
+| `--grad-accum-steps` | `1` | micro-batches por step del optimizador (grad accumulation) |
+| `--max-grad-retries` | `3` | fallos inf/nan **consecutivos** antes del stop de emergencia |
+
+#### Spike guard (estilo ZClip) + rollback
+
+| Flag | Default | Descripción |
+|---|---|---|
+| `--spike-z` | `2.5` | z-score para spike moderado (clip adaptativo, tier 1) |
+| `--spike-z-rollback` | `5.0` | z-score para spike severo (rollback + salto de ventana, tier 2) |
+| `--spike-warmup` | `25` | steps antes de activar la detección |
+| `--spike-alpha` | `0.97` | factor EMA de las estadísticas del grad norm |
+| `--spike-lr-mode` | `temporary` | reducción de LR tras rollback: `temporary`, `permanent` o `none` |
+| `--spike-lr-factor` | `0.5` | factor de reducción temporal de LR |
+| `--spike-cooldown` | `300` | steps con LR reducido (modo `temporary`) |
+| `--spike-lr-ramp` | `100` | steps de rampa lineal de regreso al schedule |
+| `--max-rollbacks` | `5` | rollbacks máximos antes del stop de emergencia |
+| `--snapshot-every` | `10` | frecuencia (steps) del snapshot "last known good" en RAM |
+| `--no-spike-guard` | — | desactiva el spike guard y los snapshots de rollback |
+
+> El `--lr-muon` por defecto es **`2e-3`**: `0.02` es el LR típico de Muon para **pre-training desde cero** (nanoGPT speedrun); para **fine-tuning** de un modelo ya pre-entrenado es muy alto y dispara spikes (ver [§ 9](#9-estabilidad-del-entrenamiento)). Si entrenas desde cero puedes subirlo, pero bárrelo antes.
 
 ---
 
@@ -121,14 +150,49 @@ exp/es-asr/
 ```
 
 ### CSV `train_log.csv` (por step)
-`step, epoch, loss, simple_loss, pruned_loss, s_scale, p_scale, lr_muon, lr_adamw, grad_norm, clip_ratio, frames, batch_size, tok_per_sec, batches_per_sec, mem_alloc_gb, mem_reserved_gb, elapsed_sec`
+`step, epoch, loss, simple_loss, pruned_loss, s_scale, p_scale, lr_muon, lr_adamw, grad_norm, clip_ratio, frames, batch_size, tok_per_sec, batches_per_sec, mem_alloc_gb, mem_reserved_gb, elapsed_sec, nan_failures, lr_scale, gn_z, gn_mu, gn_sigma, spike_tier, zclip_cap, rollbacks, lr_temp_scale`
+
+- `nan_failures`: fallos inf/nan consecutivos (step exitoso lo resetea).
+- `lr_scale`: `0.5 ** lr_halvings` (factor acumulado de halvings permanentes por inf/nan).
+- `gn_z`, `gn_mu`, `gn_sigma`: z-score y EMAs de la media/desviación del grad norm pre-clip.
+- `spike_tier`: `0` normal, `1` spike moderado (clip adaptativo), `2` spike severo (rollback).
+- `zclip_cap`: norma objetivo aplicada por el clip adaptativo del tier 1 (`-1` si no se aplicó).
+- `rollbacks`: contador acumulado de rollbacks por spike severo.
+- `lr_temp_scale`: multiplicador de LR temporal vigente (1.0 fuera de cooldown).
 
 ### CSV `val_log.csv` (cada `val_every`)
 `step, val_loss, wer`
 
 ---
 
-## 6. Reanudar
+## 6. Estabilidad del entrenamiento
+
+El entrenamiento puede divergir por spikes de gradiente (normas hasta ~1000× lo típico) y valores inf/nan. Se implementan **tres capas** de protección, en este orden en cada step:
+
+### 1. Grad accumulation + guard inf/nan (`--grad-accum-steps`, `--max-grad-retries`)
+- Los batches se agrupan en ventanas de `--grad-accum-steps` micro-batches; cada micro hace `backward()` escalado por `1/nf/len(micros)` y hay **un solo** `opt.step()` por ventana.
+- Antes del step se verifica que la loss y los gradientes sean finitos (`grads_have_inf_nan`).
+- Si hay inf/nan: se descartan los gradientes, se **reduce el LR a la mitad de forma permanente** (`scheduler.scale_base(0.5)`) y se **reintenta la misma ventana**. Tras `--max-grad-retries` fallos **consecutivos** (un step exitoso resetea el contador) se guarda un checkpoint de emergencia y se detiene el run (`exit 1`).
+
+2. **Spike guard estilo ZClip** (`--spike-z`, `--spike-z-rollback`, etc.)
+- Se mantienen EMAs (`--spike-alpha`) de la **media μ y desviación σ del grad norm pre-clip**, inicializadas con una ventana de `--spike-warmup` steps.
+- **Tier 1** (`z > --spike-z`): spike moderado → **clip adaptativo** reciproqual a `μ + (z²/z)·σ` (además del clip fijo `--grad-clip`). Entrenamiento continúa sin interrumpir.
+- **Tier 2** (`z > --spike-z-rollback`): spike severo → **rollback**: se restaura el último snapshot sano (`--snapshot-every` steps, guardado en RAM CPU), se **salta la ventana ofensora** (receta PaLM/GLM-130B: el spike no suele reproducirse al reprocesar el mismo batch), se reduce el LR **temporalmente** (`--spike-lr-factor` durante `--spike-cooldown` steps + rampa `--spike-lr-ramp`; o `permanent`/`none`), y el contador de step retrocede.
+- Tras `--max-rollbacks` rollbacks → checkpoint de emergencia y detención (`reason: spike_rollbacks`).
+
+3. **Clip de gradiente fijo** (`--grad-clip`): backstop para el resto.
+
+> Los valores spiky **no contaminan** las estadísticas del tracker (el tier 2 se excluye y el tier 1 se aporta capado). El estado del tracker, `lr_halvings` y `rollbacks` se guardan en todos los checkpoints, por lo que un resume no pierde la protección ni los halvings permanentes.
+
+### Por qué los spikes y el LR por defecto
+
+- **Muon/TurboMuon es inestable a escala**: Kimi K2 (arXiv:2507.20534) documentó loss spikes con Muon *vanilla* y tuvo que inventar **MuonClip** (cap de attention logits) para entrenar 15.5T tokens con *cero* spikes. En experimentos mid-scale MuonClip eliminó spikes que Muon sí mostraba.
+- **El clipping fijo falla**: la distribución de grad norms deriva durante el entrenamiento, así que un umbral constante sub/sobre-recorta (ZClip, arXiv:2504.02507; spikes hasta 1000× lo típico).
+- **`--lr-muon` en fine-tuning**: `0.02` es el LR de Muon para *pre-training desde cero*; para fine-tuning de un modelo pre-entrenado el LR óptimo baja y `0.02` dispara spikes. El default es ahora **`2e-3`** (el blog de PyTorch/DeepSpeed fine-tuneando Moonlight-16B usó `1e-4`). Si ves spikes, baja el LR y/o sube `--spike-warmup` si aparecen temprano.
+
+---
+
+## 7. Reanudar
 
 El entrenamiento **auto-resume** desde el checkpoint rolling más reciente si existe. Para uno específico:
 ```bash
@@ -137,7 +201,7 @@ python trainer.py ... --resume exp/es-asr/checkpoints/rolling_step-0001000.pt
 
 ---
 
-## 7. Optimizadores
+## 8. Optimizadores
 
 ### Turbo-Muon (default)
 [Turbo-Muon](https://arxiv.org/abs/2512.04632) (Boissin et al. 2025) precondiciona el gradiente con AOL antes de las iteraciones de Newton-Schulz. En la P40 (sin GEMM bf16) las iteraciones NS se ejecutan en **float32**. Se aplica a parámetros 2D (matrices ocultas); AdamW maneja el resto (biases, normas, convoluciones 3D, embeddings).
@@ -149,7 +213,7 @@ python trainer.py ... --resume exp/es-asr/checkpoints/rolling_step-0001000.pt
 
 ---
 
-## 8. Arquitectura del entrenamiento
+## 9. Arquitectura del entrenamiento
 
 - **Modelo:** `AudenAI/auden-tta-m10` (Zipformer encoder + RNNT decoder/joiner).
 - **Ramas congeladas:** text_encoder (BERT), attention_decoder, heads de align (no necesarias para ASR transcribe). Sólo entrena encoder + decoder RNNT + joiner + proyecciones (~137M params).
@@ -160,7 +224,7 @@ python trainer.py ... --resume exp/es-asr/checkpoints/rolling_step-0001000.pt
 
 ---
 
-## 9. Monitoreo
+## 10. Monitoreo
 
 ```bash
 # ver progreso en vivo del CSV
@@ -172,7 +236,7 @@ tail -f exp/es-asr/train_log.csv
 
 ---
 
-## 10. Resolución de problemas
+## 11. Resolución de problemas
 
 | Problema | Solución |
 |---|---|

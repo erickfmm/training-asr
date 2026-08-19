@@ -7,6 +7,10 @@ Características:
   - Grad accumulation (--grad-accum-steps) + protección inf/nan: descarta la
     ventana afectada, reduce el LR a la mitad (permanente) y reintenta; tras
     3 fallos consecutivos guarda checkpoint de emergencia y detiene el run.
+  - Spike guard estilo ZClip: z-score del grad norm con EMAs; spikes moderados
+    (z>2.5) se recortan con clip adaptativo; spikes severos (z>5) hacen
+    rollback al último snapshot sano (cada N steps), reducen el LR
+    temporalmente y saltan la ventana afectada (receta PaLM/GLM-130B).
   - Logging por step en CSV (loss, lr real, norma del gradiente, throughput, mem).
   - Checkpoints rolling cada 500 steps (conserva los últimos 3) + best-3 por WER.
   - Sincronización opcional con Weights & Biases (--wandb).
@@ -314,16 +318,41 @@ class WarmupCosine:
         self.total = max(1, total_steps)
         self.base = base_lrs
         self.min_frac = min_frac
+        # reducción temporal de LR tras spike/rollback
+        self._temp_factor = 1.0
+        self._temp_left = 0
+        self._temp_ramp = 1
+
+    def trigger_temp(self, factor: float, cooldown: int, ramp: int):
+        """LR *= factor durante `cooldown` steps, luego rampa lineal a 1.0
+        en `ramp` steps (para rollbacks de spikes)."""
+        self._temp_factor = factor
+        self._temp_left = cooldown + ramp
+        self._temp_ramp = max(1, ramp)
+
+    def temp_scale(self) -> float:
+        if self._temp_left <= 0:
+            return 1.0
+        if self._temp_left <= self._temp_ramp:
+            return self._temp_factor + (1 - self._temp_factor) * (
+                self._temp_ramp - self._temp_left
+            ) / self._temp_ramp
+        return self._temp_factor
+
+    def advance_temp(self):
+        if self._temp_left > 0:
+            self._temp_left -= 1
 
     def scale_base(self, factor: float):
         """Multiplica los base LR de forma permanente y los aplica ya a los
         param_groups (sobrevive a los próximos step(), que recalculan desde base)."""
         for name in self.base:
             self.base[name] *= factor
-        set_lrs(self.optimizers, self.base)
+        set_lrs(self.optimizers, {n: self.base[n] * self.temp_scale() for n in self.base})
         return get_lrs(self.optimizers)
 
     def step(self, step: int):
+        ts = self.temp_scale()
         for name in self.base:
             if step < self.warmup:
                 frac = step / self.warmup
@@ -331,8 +360,120 @@ class WarmupCosine:
                 p = (step - self.warmup) / max(1, self.total - self.warmup)
                 p = min(1.0, max(0.0, p))
                 frac = self.min_frac + 0.5 * (1 - self.min_frac) * (1 + math.cos(math.pi * p))
-            set_lrs(self.optimizers, {name: self.base[name] * frac})
+            set_lrs(self.optimizers, {name: self.base[name] * frac * ts})
         return get_lrs(self.optimizers)
+
+
+# ----------------------------------------------------------------------------
+# Spike guard: z-score del grad norm con EMAs (estilo ZClip, arXiv:2504.02507)
+# ----------------------------------------------------------------------------
+class GradNormTracker:
+    """EMAs de media/desviación del grad norm pre-clip. Detecta spikes por
+    z-score: tier 1 (moderado) -> clip adaptativo; tier 2 (severo) -> rollback.
+    Los valores spiky no contaminan las estadísticas (tier 2 excluido,
+    tier 1 aportado capado a mu + z*sigma)."""
+
+    def __init__(self, alpha: float = 0.97, warmup: int = 25,
+                 z_thresh: float = 2.5, z_rollback: float = 5.0):
+        self.alpha = alpha
+        self.warmup = max(2, warmup)
+        self.z_thresh = z_thresh
+        self.z_rollback = z_rollback
+        self.mu = None
+        self.sigma = 0.0
+        self.n = 0
+        self._hist: List[float] = []
+
+    @property
+    def ready(self) -> bool:
+        return self.n >= self.warmup
+
+    def observe(self, g: float):
+        """Actualiza EMAs y retorna (z, tier, cap).
+        tier: 0 normal | 1 spike moderado (cap = norma objetivo del clip
+        adaptativo, reciprocual z* = z_thres²/z) | 2 spike severo (rollback)."""
+        if not self.ready:
+            self._warmup_update(g)
+            return 0.0, 0, None
+        # floor relativo: evita z explosivos por sigma~0
+        sigma = max(self.sigma, 1e-3 * max(1e-12, abs(self.mu)))
+        z = (g - self.mu) / sigma
+        if z > self.z_rollback:
+            return z, 2, None
+        if z > self.z_thresh:
+            cap = self.mu + (self.z_thresh ** 2 / z) * sigma
+            self._ema_update(min(g, self.mu + self.z_thresh * sigma))
+            return z, 1, cap
+        self._ema_update(g)
+        return z, 0, None
+
+    def _warmup_update(self, g: float):
+        self._hist.append(g)
+        self.n = len(self._hist)
+        if len(self._hist) >= self.warmup:
+            # init estilo ZClip: media/std muestral de la ventana de warmup
+            m = sum(self._hist) / len(self._hist)
+            v = sum((x - m) ** 2 for x in self._hist) / len(self._hist)
+            self.mu, self.sigma = m, math.sqrt(v)
+            self._hist = []
+
+    def _ema_update(self, g: float):
+        a = self.alpha
+        new_mu = a * self.mu + (1 - a) * g
+        self.sigma = math.sqrt(a * self.sigma ** 2 + (1 - a) * (g - self.mu) ** 2)
+        self.mu = new_mu
+        self.n += 1
+
+    def state(self) -> dict:
+        return {"mu": self.mu, "sigma": self.sigma, "n": self.n}
+
+    def load(self, s: dict):
+        if s and s.get("mu") is not None:
+            self.mu, self.sigma, self.n = s["mu"], s["sigma"], s["n"]
+
+
+def _tensors_to_cpu(obj):
+    if torch.is_tensor(obj):
+        return obj.detach().cpu().clone()
+    if isinstance(obj, dict):
+        return {k: _tensors_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_tensors_to_cpu(v) for v in obj)
+    return obj
+
+
+def _tensors_to_device(obj, device):
+    if torch.is_tensor(obj):
+        return obj.to(device)
+    if isinstance(obj, dict):
+        return {k: _tensors_to_device(v, device) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_tensors_to_device(v, device) for v in obj)
+    return obj
+
+
+def snapshot_state(model, optimizers, tracker: GradNormTracker, step: int,
+                   nan_failures: int, lr_halvings: int, rollbacks: int,
+                   best_wer: float) -> dict:
+    """Snapshot 'last known good' en RAM CPU para rollbacks de spikes."""
+    return {
+        "step": step,
+        "model_state": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+        "optimizers": {name: _tensors_to_cpu(opt.state_dict()) for name, opt in optimizers},
+        "tracker": tracker.state(),
+        "nan_failures": nan_failures,
+        "lr_halvings": lr_halvings,
+        "rollbacks": rollbacks,
+        "best_wer": best_wer,
+    }
+
+
+def restore_snapshot(snap: dict, model, optimizers, tracker: GradNormTracker, device):
+    model.load_state_dict(snap["model_state"])
+    for name, opt in optimizers:
+        if name in snap["optimizers"]:
+            opt.load_state_dict(_tensors_to_device(snap["optimizers"][name], device))
+    tracker.load(snap["tracker"])
 
 
 # ----------------------------------------------------------------------------
@@ -544,6 +685,18 @@ class CSVLogger:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.columns = columns
+        # migración: si existe un CSV con header viejo (sin columnas nuevas),
+        # se renombra y se empieza uno nuevo en lugar de corruptar filas.
+        if self.path.exists() and self.path.stat().st_size > 0:
+            with open(self.path, newline="") as f:
+                old_header = f.readline().strip().split(",")
+            if old_header != columns:
+                migrated = self.path.with_name(
+                    f"{self.path.stem}.old-{int(time.time())}{self.path.suffix}"
+                )
+                self.path.replace(migrated)
+                log.warning("CSV con columnas viejas; se migra: %s -> %s",
+                            self.path.name, migrated.name)
         self.f = open(self.path, "a", newline="", buffering=1)
         self.writer = csv.DictWriter(self.f, fieldnames=columns)
         if self.path.stat().st_size == 0:
@@ -586,7 +739,7 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=4)
     # entrenamiento
     p.add_argument("--optimizer", choices=["turbo_muon", "adamw"], default="turbo_muon")
-    p.add_argument("--lr-muon", type=float, default=0.02)
+    p.add_argument("--lr-muon", type=float, default=2e-3)
     p.add_argument("--lr-adamw", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-steps", type=int, default=1000)
@@ -596,6 +749,29 @@ def parse_args():
                    help="micro-batches acumulados por step del optimizador")
     p.add_argument("--max-grad-retries", type=int, default=3,
                    help="fallos inf/nan consecutivos antes del stop de emergencia")
+    # spike guard (z-score sobre grad norm, estilo ZClip)
+    p.add_argument("--no-spike-guard", action="store_true",
+                   help="desactiva el spike guard y los snapshots de rollback")
+    p.add_argument("--spike-z", type=float, default=2.5,
+                   help="z-score para spike moderado (clip adaptativo)")
+    p.add_argument("--spike-z-rollback", type=float, default=5.0,
+                   help="z-score para spike severo (rollback + salto de ventana)")
+    p.add_argument("--spike-warmup", type=int, default=25,
+                   help="steps antes de activar la detección de spikes")
+    p.add_argument("--spike-alpha", type=float, default=0.97,
+                   help="factor EMA de las estadísticas del grad norm")
+    p.add_argument("--spike-lr-mode", choices=["temporary", "permanent", "none"],
+                   default="temporary", help="reducción de LR tras un rollback")
+    p.add_argument("--spike-lr-factor", type=float, default=0.5,
+                   help="factor de reducción temporal de LR tras rollback")
+    p.add_argument("--spike-cooldown", type=int, default=300,
+                   help="steps con LR reducido tras rollback (modo temporary)")
+    p.add_argument("--spike-lr-ramp", type=int, default=100,
+                   help="steps de rampa lineal de regreso al LR del schedule")
+    p.add_argument("--max-rollbacks", type=int, default=5,
+                   help="rollbacks máximos antes del stop de emergencia")
+    p.add_argument("--snapshot-every", type=int, default=10,
+                   help="frecuencia (steps) del snapshot 'last known good' en RAM")
     p.add_argument("--rnnt-warm-step", type=int, default=2000)
     p.add_argument("--simple-loss-scale", type=float, default=0.5)
     p.add_argument("--prune-range", type=int, default=5)
@@ -686,6 +862,19 @@ def main():
     base_lrs = get_lrs(optimizers)
     scheduler = WarmupCosine(optimizers, args.warmup_steps, args.max_steps, base_lrs)
 
+    # ---- spike guard ----
+    spike_guard = not args.no_spike_guard
+    tracker = GradNormTracker(args.spike_alpha, args.spike_warmup,
+                              args.spike_z, args.spike_z_rollback)
+    snap = None
+    rollbacks = 0
+    lr_halvings = 0
+    nan_failures = 0
+
+    def _extra_state() -> dict:
+        return {"lr_halvings": lr_halvings, "rollbacks": rollbacks,
+                "grad_tracker": tracker.state()}
+
     # ---- feature extractor ----
     fbank = FbankExtractor()
 
@@ -702,6 +891,18 @@ def main():
     # ---- resume ----
     start_step = 0
     best_wer = float("inf")
+
+    def _restore_ckpt_state(ckpt: dict):
+        nonlocal lr_halvings, rollbacks
+        if ckpt.get("grad_tracker"):
+            tracker.load(ckpt["grad_tracker"])
+        if ckpt.get("lr_halvings"):
+            # los halvings permanentes viven en scheduler.base, que no se
+            # guarda: se reaplican al reanudar
+            lr_halvings = ckpt["lr_halvings"]
+            scheduler.scale_base(0.5 ** lr_halvings)
+        rollbacks = ckpt.get("rollbacks", 0)
+
     if args.resume and Path(args.resume).exists():
         ckpt = torch.load(args.resume, map_location="cpu")
         model.load_state_dict(ckpt["model_state"], strict=False)
@@ -710,6 +911,7 @@ def main():
                 opt.load_state_dict(ckpt["optimizers"][name])
         start_step = ckpt["step"]
         best_wer = ckpt.get("best_wer", float("inf"))
+        _restore_ckpt_state(ckpt)
         log.info("Resumido desde step %d (best_wer=%.4f)", start_step, best_wer)
     elif not args.resume:
         # auto-resume desde el rolling más reciente
@@ -724,6 +926,7 @@ def main():
                     opt.load_state_dict(ckpt["optimizers"][name])
             start_step = ckpt["step"]
             best_wer = ckpt.get("best_wer", float("inf"))
+            _restore_ckpt_state(ckpt)
             log.info("Auto-resume desde %s (step %d)", rolling[-1].name, start_step)
 
     # ---- loggers CSV ----
@@ -733,6 +936,8 @@ def main():
         "grad_norm", "clip_ratio", "frames", "batch_size",
         "tok_per_sec", "batches_per_sec", "mem_alloc_gb", "mem_reserved_gb",
         "elapsed_sec", "nan_failures", "lr_scale",
+        "gn_z", "gn_mu", "gn_sigma", "spike_tier", "zclip_cap",
+        "rollbacks", "lr_temp_scale",
     ])
     val_log = CSVLogger(str(out_dir / "val_log.csv"), [
         "step", "val_loss", "wer",
@@ -740,8 +945,6 @@ def main():
 
     # ---- bucle ----
     accum = max(1, args.grad_accum_steps)
-    nan_failures = 0  # fallos inf/nan consecutivos (global; step exitoso reinicia)
-    lr_halvings = 0
 
     rng = np.random.default_rng(args.seed)
     epoch = 0
@@ -784,6 +987,7 @@ def main():
             ]
 
             # ---- intentos con protección inf/nan (misma ventana hasta éxito) ----
+            skip_window = False
             while True:
                 for opt in optimizers:
                     opt[1].zero_grad(set_to_none=True)
@@ -837,7 +1041,7 @@ def main():
                         em_path = ckpt_dir / f"emergency_step-{step:07d}.pt"
                         save_checkpoint(
                             em_path, model, optimizers, scheduler, step, best_wer, args,
-                            extra={"emergency": True, "lr_halvings": lr_halvings,
+                            extra={**_extra_state(), "emergency": True,
                                    "nan_failures": nan_failures},
                         )
                         train_log.close()
@@ -851,9 +1055,62 @@ def main():
 
                 # ---- update (ventana limpia) ----
                 grad_norm, clip_ratio = compute_grad_norm_and_clip(model, args.grad_clip)
+
+                # ---- spike guard: z-score del grad norm pre-clip ----
+                spike_tier, gn_z, gn_mu, gn_sigma, zclip_cap = 0, 0.0, 0.0, 0.0, -1.0
+                if spike_guard:
+                    gn_z, spike_tier, cap = tracker.observe(grad_norm)
+                    gn_mu = tracker.mu if tracker.mu is not None else 0.0
+                    gn_sigma = tracker.sigma
+                    if spike_tier == 1 and cap is not None:
+                        zclip_cap = cap
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), cap)
+                        clip_ratio = grad_norm / max(1.0, cap)
+                        log.warning("spike tier1: gn %.2f -> cap %.2f (z=%.1f)",
+                                    grad_norm, cap, gn_z)
+                    elif spike_tier == 2:
+                        rollbacks += 1
+                        log.warning("spike tier2: gn %.2f (z=%.1f) | rollback %d/%d",
+                                    grad_norm, gn_z, rollbacks, args.max_rollbacks)
+                        if rollbacks > args.max_rollbacks:
+                            em_path = ckpt_dir / f"emergency_step-{step:07d}.pt"
+                            save_checkpoint(
+                                em_path, model, optimizers, scheduler, step, best_wer,
+                                args, extra={**_extra_state(), "emergency": True,
+                                             "reason": "spike_rollbacks"},
+                            )
+                            train_log.close()
+                            val_log.close()
+                            if wandb_run:
+                                wandb_run.finish(exit_code=1)
+                            log.error("%d rollbacks por spikes (máx %d). "
+                                      "Stop de emergencia: %s",
+                                      rollbacks, args.max_rollbacks, em_path)
+                            sys.exit(1)
+                        # rollback al último snapshot sano y salto de ventana
+                        if snap is None:
+                            log.warning("sin snapshot todavía: ventana saltada sin update")
+                        else:
+                            restore_snapshot(snap, model, optimizers, tracker, device)
+                            step = snap["step"]
+                            nan_failures = snap["nan_failures"]
+                            lr_halvings = snap["lr_halvings"]
+                            best_wer = snap["best_wer"]
+                            log.info("rollback a step %d (snapshot sano)", step)
+                        if args.spike_lr_mode == "temporary":
+                            scheduler.trigger_temp(args.spike_lr_factor,
+                                                   args.spike_cooldown,
+                                                   args.spike_lr_ramp)
+                        elif args.spike_lr_mode == "permanent":
+                            scheduler.scale_base(args.spike_lr_factor)
+                            lr_halvings += 1
+                        skip_window = True
+                        break
+
                 lrs = scheduler.step(step)
                 for _, opt in optimizers:
                     opt.step()
+                scheduler.advance_temp()
 
                 nan_failures = 0
                 step += 1
@@ -882,23 +1139,35 @@ def main():
                         "elapsed_sec": now - t0,
                         "nan_failures": nan_failures,
                         "lr_scale": 0.5 ** lr_halvings,
+                        "gn_z": gn_z, "gn_mu": gn_mu, "gn_sigma": gn_sigma,
+                        "spike_tier": spike_tier, "zclip_cap": zclip_cap,
+                        "rollbacks": rollbacks,
+                        "lr_temp_scale": scheduler.temp_scale(),
                     }
                     train_log.log(row)
                     if wandb_run:
                         wandb_run.log(row, step=step)
                     log.info(
-                        "step %d | loss %.4f | lr_m %.5f lr_a %.5f | gn %.2f | %.0f batches/s | %.1fGB",
+                        "step %d | loss %.4f | lr_m %.5f lr_a %.5f | gn %.2f (z %.1f) | %.0f batches/s | %.1fGB",
                         step, win_loss,
-                        row["lr_muon"], row["lr_adamw"], grad_norm, fps, mem_a,
+                        row["lr_muon"], row["lr_adamw"], grad_norm, gn_z, fps, mem_a,
                     )
                     last_log = now
                     last_frames = nf_total
+                # ---- snapshot 'last known good' para rollbacks ----
+                if spike_guard and step % args.snapshot_every == 0:
+                    snap = snapshot_state(model, optimizers, tracker, step,
+                                          nan_failures, lr_halvings, rollbacks, best_wer)
                 break  # ventana completada con éxito
+
+            if skip_window:
+                continue  # saltar rolling/validación para la ventana descartada
 
             # ---- checkpoint rolling ----
             if step % args.rolling_every == 0:
                 rp = ckpt_dir / f"rolling_step-{step:07d}.pt"
-                save_checkpoint(rp, model, optimizers, scheduler, step, best_wer, args)
+                save_checkpoint(rp, model, optimizers, scheduler, step, best_wer,
+                                args, extra=_extra_state())
                 manage_rolling(ckpt_dir, args.rolling_keep)
 
             # ---- validación + best ----
@@ -913,7 +1182,8 @@ def main():
                 if wer < best_wer:
                     best_wer = wer
                     bp = ckpt_dir / f"best_step-{step:07d}_wer-{wer:.4f}.pt"
-                    save_checkpoint(bp, model, optimizers, scheduler, step, best_wer, args)
+                    save_checkpoint(bp, model, optimizers, scheduler, step, best_wer,
+                                    args, extra=_extra_state())
                     save_model_export(out_dir / "best_model", model)
                     manage_best3(ckpt_dir, bp, wer)
                 gc.collect()
@@ -921,7 +1191,8 @@ def main():
 
     # ---- fin ----
     final_path = ckpt_dir / f"final_step-{step:07d}.pt"
-    save_checkpoint(final_path, model, optimizers, scheduler, step, best_wer, args)
+    save_checkpoint(final_path, model, optimizers, scheduler, step, best_wer,
+                    args, extra=_extra_state())
     save_model_export(out_dir / "final_model", model)
     train_log.close()
     val_log.close()
