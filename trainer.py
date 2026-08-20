@@ -1045,6 +1045,9 @@ def parse_args():
     p.add_argument("--wandb", action="store_true", help="activar sincronización wandb")
     p.add_argument("--wandb-project", default="auden-asr-es")
     p.add_argument("--wandb-run-name", default="")
+    p.add_argument("--wandb-resume-id", default="",
+                   help="ID de run wandb para resumir (resume='allow'); "
+                        "si vacío, se deriva de --resume o se crea uno nuevo")
     # congelado
     p.add_argument("--no-freeze-branches", action="store_true",
                    help="no congelar text_encoder/attention_decoder/align (auden)")
@@ -1074,15 +1077,27 @@ def main():
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- wandb ----
+    # IDs de run estables: --wandb-resume-id tiene prioridad; si no, se deriva
+    # del checkpoint (--resume) para que un reentrenamiento continúe la misma
+    # run en lugar de arrancar desde step 0 (que rompe la monotonicidad).
     wandb_run = None
+    wandb_run_id = None
     if args.wandb:
         import wandb
+
+        if args.wandb_resume_id:
+            wandb_run_id = args.wandb_resume_id
+        elif args.resume and Path(args.resume).exists():
+            # nombre determinista basado en el checkpoint: mismo resume -> misma run
+            wandb_run_id = "asr-" + Path(args.resume).resolve().name
 
         wandb_run = wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name or None,
             config=vars(args),
             dir=str(out_dir),
+            id=wandb_run_id,
+            resume="allow" if wandb_run_id else None,
         )
     else:
         os.environ.setdefault("WANDB_MODE", "disabled")
@@ -1236,6 +1251,20 @@ def main():
     accum = max(1, args.grad_accum_steps)
 
     step = start_step
+    # contador monotónico para wandb: nunca decrece, incluso tras rollbacks /
+    # reintentos nan / resume. wandb exige steps estrictamente crecientes; el
+    # step del optimizador puede retroceder (rollback a snapshot), por lo que
+    # NO se puede usar como step de wandb.
+    wandb_step = 0
+    if wandb_run is not None:
+        # al resumir, arrancar por delante del último step logueado por wandb
+        # (last_step viene de la run remota si se reanudó con resume='allow').
+        try:
+            wandb_step = getattr(wandb_run, "step", 0) or 0
+        except Exception:
+            wandb_step = 0
+        # red por seguridad: nunca menor que el step del optimizador reanudado
+        wandb_step = max(wandb_step, start_step)
     t0 = time.time()
     last_log = time.time()
     last_frames = 0
@@ -1387,6 +1416,7 @@ def main():
 
                 nan_failures = 0
                 step += 1
+                wandb_step += 1  # monotónico: no se deshace en rollbacks
                 n_micros = len(micros)
                 win_loss = loss_sum / n_micros
                 win_simple = simple_sum / n_micros
@@ -1419,7 +1449,7 @@ def main():
                     }
                     train_log.log(row)
                     if wandb_run:
-                        wandb_run.log(row, step=step)
+                        wandb_run.log(row, step=wandb_step)
                     log.info(
                         "step %d | loss %.4f | lr_m %.5f lr_a %.5f | gn %.2f (z %.1f) | %.0f batches/s | %.1fGB",
                         step, win_loss,
@@ -1450,7 +1480,7 @@ def main():
                 )
                 val_log.log({"step": step, "val_loss": vloss, "wer": wer})
                 if wandb_run:
-                    wandb_run.log({"val_loss": vloss, "wer": wer}, step=step)
+                    wandb_run.log({"val_loss": vloss, "wer": wer}, step=wandb_step)
                 log.info("VALID step %d | val_loss %.4f | WER %.4f", step, vloss, wer)
                 if wer < best_wer:
                     best_wer = wer
