@@ -2,6 +2,9 @@ datasets/
 
 # Experimentos, modelos descargados, wandb
 exp/
+exp-bak/
+nohup.out
+nohup.out.*
 models/
 wandb/
 Auden/
