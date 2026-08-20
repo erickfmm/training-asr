@@ -585,6 +585,17 @@ class WarmupCosine:
         if self._temp_left > 0:
             self._temp_left -= 1
 
+    def temp_state(self) -> dict:
+        return {"factor": self._temp_factor, "left": self._temp_left,
+                "ramp": self._temp_ramp}
+
+    def load_temp_state(self, s: dict):
+        if not s:
+            return
+        self._temp_factor = float(s.get("factor", 1.0))
+        self._temp_left = int(s.get("left", 0))
+        self._temp_ramp = max(1, int(s.get("ramp", 1)))
+
     def scale_base(self, factor: float):
         """Multiplica los base LR de forma permanente y los aplica ya a los
         param_groups (sobrevive a los próximos step(), que recalculan desde base)."""
@@ -941,6 +952,19 @@ class CSVLogger:
         self.f.close()
 
 
+def epoch_from_csv(path: Path) -> int:
+    try:
+        with open(path, newline="") as f:
+            last = None
+            for row in csv.DictReader(f):
+                last = row
+            if last and last.get("epoch"):
+                return max(0, int(float(last["epoch"])))
+    except Exception:
+        pass
+    return 0
+
+
 # ----------------------------------------------------------------------------
 # Texto: normalización mínima (minúsculas, quitar ¿¡)
 # ----------------------------------------------------------------------------
@@ -1117,9 +1141,15 @@ def main():
     lr_halvings = 0
     nan_failures = 0
 
+    rng = np.random.default_rng(args.seed)
+    epoch = 0
+
     def _extra_state() -> dict:
         return {"lr_halvings": lr_halvings, "rollbacks": rollbacks,
-                "grad_tracker": tracker.state()}
+                "grad_tracker": tracker.state(),
+                "scheduler_temp": scheduler.temp_state(),
+                "rng_state": rng.bit_generator.state,
+                "epoch": epoch}
 
     # ---- datasets (CVesDataset es común; el backend decide features) ----
     train_ds = CVesDataset(
@@ -1136,7 +1166,7 @@ def main():
     best_wer = float("inf")
 
     def _restore_ckpt_state(ckpt: dict):
-        nonlocal lr_halvings, rollbacks
+        nonlocal lr_halvings, rollbacks, rng, epoch
         if ckpt.get("grad_tracker"):
             tracker.load(ckpt["grad_tracker"])
         if ckpt.get("lr_halvings"):
@@ -1145,6 +1175,22 @@ def main():
             lr_halvings = ckpt["lr_halvings"]
             scheduler.scale_base(0.5 ** lr_halvings)
         rollbacks = ckpt.get("rollbacks", 0)
+        # LR temporal activo (cooldown/rampa tras un rollback): sin esto, un
+        # checkpoint tomado durante la reducción la perdería al reanudar.
+        if ckpt.get("scheduler_temp"):
+            scheduler.load_temp_state(ckpt["scheduler_temp"])
+        if ckpt.get("rng_state"):
+            # RNG del dataloader en el momento del checkpoint: el siguiente
+            # make_batches produce los batches de la época siguiente al run
+            # original (los no consumidos de la época interrumpida se saltan).
+            rng.bit_generator.state = ckpt["rng_state"]
+            epoch = int(ckpt.get("epoch", 0))
+        else:
+            # checkpoint legacy sin rng_state: aproximar la época desde el
+            # CSV y derivar un RNG determinista que no repita desde el inicio
+            epoch = epoch_from_csv(out_dir / "train_log.csv")
+            rng = np.random.default_rng(args.seed + epoch)
+            log.info("Checkpoint legacy: época aproximada desde CSV = %d", epoch)
 
     if args.resume and Path(args.resume).exists():
         ckpt = torch.load(args.resume, map_location="cpu")
@@ -1189,8 +1235,6 @@ def main():
     # ---- bucle ----
     accum = max(1, args.grad_accum_steps)
 
-    rng = np.random.default_rng(args.seed)
-    epoch = 0
     step = start_step
     t0 = time.time()
     last_log = time.time()
