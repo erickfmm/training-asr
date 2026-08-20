@@ -243,6 +243,248 @@ def collate(batch: List[dict], fbank: FbankExtractor, pad_val: float = math.log(
 
 
 # ----------------------------------------------------------------------------
+# Model backends: auden (RNNT) | whisper-medium (seq2seq CE)
+# ----------------------------------------------------------------------------
+# El bucle de entrenamiento, optimizadores híbridos (TurboMuon+AdamW),
+# warmup-coseno, grad-accum, spike-guard/rollback y checkpointing son idénticos
+# para ambos backends: sólo difieren la carga, las features, la pérdida y el
+# decode. Whisper-medium se baja de HF Hub (última revisión) con
+# WhisperForConditionalGeneration.from_pretrained("openai/whisper-medium").
+#
+# Literatura:
+#   - Vividh-ASR (arXiv:2605.13087): adaptar el decoder preserva la geometría
+#     acústica del encoder y iguala/beatea el full fine-tune en Common Voice.
+#   - Gumbel-BEARD (arXiv:2606.11429): SOTA con Whisper-medium adaptando poco
+#     el encoder; 10h etiquetados igualan un baseline supervisado de 133h.
+#   - Continual-learning (arXiv:2407.03645): freeze + LR re-scaling al
+#     adaptar Whisper a lenguas no vistas de Common Voice.
+# ----------------------------------------------------------------------------
+class ModelBackend:
+    """Interfaz común para los backends de modelo."""
+    name = ""
+
+    def __init__(self, args, fbank: FbankExtractor | None = None):
+        self.args = args
+        self.fbank = fbank
+        self.model = None
+
+    def load(self, device) -> torch.nn.Module:
+        raise NotImplementedError
+
+    def freeze(self) -> None:
+        pass
+
+    def prepare_batch(self, batch: List[dict], device,
+                      normalize: bool = True) -> dict:
+        raise NotImplementedError
+
+    def forward_loss(self, model, bdict: dict, step: int, args) -> tuple:
+        """Retorna (loss, simple, pruned, s_scale, p_scale, n_frames)."""
+        raise NotImplementedError
+
+    def validate_loss(self, model, bdict: dict) -> tuple:
+        """Retorna (loss_val_float, n_frames)."""
+        raise NotImplementedError
+
+    def decode(self, model, bdict: dict) -> List[str]:
+        raise NotImplementedError
+
+    def export(self, path: Path) -> None:
+        raise NotImplementedError
+
+    def trainable_stats(self, model) -> Tuple[int, int]:
+        t = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        return t, total
+
+
+class AudenBackend(ModelBackend):
+    """Auden TTA m10 (Zipformer + RNNT). Rama ASR entrenable; el resto
+    congelado por defecto (text_encoder/attention_decoder/align)."""
+    name = "auden"
+    MODEL_HUB = "AudenAI/auden-tta-m10"
+
+    def load(self, device):
+        log.info("Cargando modelo Auden %s ...", self.MODEL_HUB)
+        from auden.auto.auto_model import AutoModel
+
+        model = AutoModel.from_pretrained(self.MODEL_HUB, map_location="cpu")
+        self.model = model
+        return model.to(device)
+
+    def freeze(self):
+        if self.args.no_freeze_branches:
+            return
+        for branch in ["text_encoder", "attention_decoder"]:
+            mod = getattr(self.model, branch, None)
+            if mod is not None:
+                for p_ in mod.parameters():
+                    p_.requires_grad = False
+                log.info("Congelado: %s", branch)
+        for nm, p_ in self.model.named_parameters():
+            if "align" in nm or "s2t" in nm:
+                p_.requires_grad = False
+
+    def prepare_batch(self, batch, device, normalize=True):
+        x, lens, texts = collate(batch, self.fbank)
+        out_texts = [normalize_text(t) for t in texts] if normalize else texts
+        return {
+            "x": x.to(device, non_blocking=True),
+            "lens": lens.to(device, non_blocking=True),
+            "texts": out_texts,
+            "raw_texts": texts,
+            "bs": len(batch),
+        }
+
+    def forward_loss(self, model, bdict, step, args):
+        outputs = model(
+            x=bdict["x"], x_lens=bdict["lens"],
+            source_texts=bdict["texts"], target_texts=bdict["texts"],
+            prune_range=args.prune_range, am_scale=args.am_scale,
+            lm_scale=args.lm_scale,
+            forward_attention_decoder=False, forward_s2t_alignment=False,
+            return_dict=True,
+        )
+        loss, simple, pruned, s_scale, p_scale = compute_loss(
+            outputs, step, args.rnnt_warm_step, args.simple_loss_scale
+        )
+        nf = (bdict["lens"] // 4).sum().item()
+        return loss, simple, pruned, s_scale, p_scale, nf
+
+    def validate_loss(self, model, bdict):
+        outputs = model(
+            x=bdict["x"], x_lens=bdict["lens"],
+            source_texts=bdict["texts"], target_texts=bdict["texts"],
+            forward_attention_decoder=False, forward_s2t_alignment=False,
+            return_dict=True,
+        )
+        simple = outputs["simple_loss"]
+        pruned = outputs["pruned_loss"]
+        nf = (bdict["lens"] // 4).sum().item()
+        return float((simple + pruned).item()), nf
+
+    def decode(self, model, bdict):
+        out = model.generate((bdict["x"], bdict["lens"]), task="transcribe")
+        return out["hypotheses"]
+
+    def export(self, path: Path):
+        path.mkdir(parents=True, exist_ok=True)
+        torch.save(self.model.state_dict(), str(path / "model.pt"))
+        try:
+            self.model.config.save_pretrained(str(path))
+        except Exception:
+            pass
+
+
+class WhisperBackend(ModelBackend):
+    """OpenAI Whisper-medium (encoder-decoder seq2seq, CE sobre token logits).
+    Encoder congelado por defecto (Vividh-ASR/Gumbel-BEARD); el decoder y
+    proj_out se entrenan. Features via WhisperFeatureExtractor (log-mel 80,
+    ventana 30s, hop 160, 16 kHz) — misma sr que auden, así CVesDataset se
+    reutiliza sin cambios."""
+    name = "whisper-medium"
+    MODEL_HUB = "openai/whisper-medium"
+
+    def __init__(self, args, fbank=None):
+        super().__init__(args, fbank=None)
+        self.processor = None
+        self.feature_extractor = None
+        self.tokenizer = None
+
+    def load(self, device):
+        log.info("Cargando modelo Whisper %s (última revisión de HF Hub) ...",
+                 self.MODEL_HUB)
+        from transformers import (WhisperForConditionalGeneration,
+                                  WhisperProcessor)
+
+        self.processor = WhisperProcessor.from_pretrained(self.MODEL_HUB)
+        self.feature_extractor = self.processor.feature_extractor
+        self.tokenizer = self.processor.tokenizer
+        model = WhisperForConditionalGeneration.from_pretrained(self.MODEL_HUB)
+        self.model = model
+        return model.to(device)
+
+    def freeze(self):
+        if self.args.whisper_unfreeze_encoder:
+            log.info("Whisper: encoder NO congelado (full fine-tune)")
+            return
+        for nm, p_ in self.model.named_parameters():
+            if nm.startswith("model.encoder."):
+                p_.requires_grad = False
+        # decoder.* y proj_out siguen entrenables; si todo quedara congelado
+        # (caso edge), reactivamos el decoder.
+        if not any(p_.requires_grad for p_ in self.model.parameters()):
+            for nm, p_ in self.model.named_parameters():
+                if nm.startswith("model.decoder."):
+                    p_.requires_grad = True
+        log.info("Whisper: encoder congelado (decoder + proj_out entrenables)")
+
+    def prepare_batch(self, batch, device, normalize=True):
+        # whisper aprende case+puntuación; no normalizamos labels para que el
+        # WER contra refs crudos sea justo.
+        wavs = [b["wav"] for b in batch]
+        texts = [b["text"] for b in batch]
+        wavs_np = [w.numpy() if torch.is_tensor(w) else w for w in wavs]
+        inputs = self.feature_extractor(
+            wavs_np, sampling_rate=16000, return_tensors="pt",
+        )
+        labels = self.tokenizer(texts, padding=True, return_tensors="pt")
+        label_ids = labels["input_ids"]
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is not None:
+            label_ids = label_ids.masked_fill(label_ids == pad_id, -100)
+        return {
+            "input_features": inputs["input_features"].to(device, non_blocking=True),
+            "labels": label_ids.to(device, non_blocking=True),
+            "texts": texts,
+            "raw_texts": texts,
+            "bs": len(batch),
+        }
+
+    def forward_loss(self, model, bdict, step, args):
+        outputs = model(
+            input_features=bdict["input_features"], labels=bdict["labels"],
+        )
+        loss = outputs.loss  # media CE sobre tokens no-padding
+        # nf=1: la CE de whisper ya está normalizada por tokens; el bucle hace
+        # (loss / 1 / n_micros).backward() → grad-accum correcto.
+        nf = 1
+        return loss, loss.detach(), loss.detach() * 0.0, 1.0, 1.0, nf
+
+    def validate_loss(self, model, bdict):
+        outputs = model(
+            input_features=bdict["input_features"], labels=bdict["labels"],
+        )
+        return float(outputs.loss.item()), 1
+
+    def decode(self, model, bdict):
+        gen_kwargs = {
+            "language": self.args.whisper_language,
+            "task": self.args.whisper_task,
+        }
+        try:
+            pred_ids = model.generate(bdict["input_features"], **gen_kwargs)
+        except Exception:
+            pred_ids = model.generate(bdict["input_features"])
+        hyps = self.processor.batch_decode(pred_ids, skip_special_tokens=True)
+        return [h.strip() for h in hyps]
+
+    def export(self, path: Path):
+        path.mkdir(parents=True, exist_ok=True)
+        self.model.save_pretrained(str(path))
+        try:
+            self.processor.save_pretrained(str(path))
+        except Exception:
+            pass
+
+
+def build_backend(args, device) -> ModelBackend:
+    if args.model == "whisper-medium":
+        return WhisperBackend(args)
+    return AudenBackend(args, FbankExtractor())
+
+
+# ----------------------------------------------------------------------------
 # Optimizadores híbridos
 # ----------------------------------------------------------------------------
 def build_optimizers(
@@ -619,7 +861,7 @@ def manage_best3(ckpt_dir: Path, new_path: Path, new_wer: float):
 # Validación: loss + WER greedy
 # ----------------------------------------------------------------------------
 @torch.no_grad()
-def validate(model, ds: CVesDataset, fbank: FbankExtractor, device,
+def validate(model, backend: ModelBackend, ds: CVesDataset, device,
              num_samples: int, batch_seconds: float):
     model.eval()
     n = min(num_samples, len(ds))
@@ -647,27 +889,17 @@ def validate(model, ds: CVesDataset, fbank: FbankExtractor, device,
     hyps: List[str] = []
     for batch_idxs in batches:
         batch = [ds[j] for j in batch_idxs]
-        x, lens, texts = collate(batch, fbank)
-        x = x.to(device)
-        lens = lens.to(device)
+        bdict = backend.prepare_batch(batch, device, normalize=False)
         try:
-            outputs = model(
-                x=x, x_lens=lens, source_texts=texts, target_texts=texts,
-                forward_attention_decoder=False, forward_s2t_alignment=False,
-                return_dict=True,
-            )
-            simple = outputs["simple_loss"]
-            pruned = outputs["pruned_loss"]
-            nf = (lens // 4).sum().item()
-            total_loss += float((simple + pruned).item())
-            total_frames += nf
+            vloss, nf = backend.validate_loss(model, bdict)
+            total_loss += vloss
+            total_frames += max(1, nf)
         except Exception as e:
             log.warning("loss val falló en un batch: %s", e)
         # greedy decode para WER
         try:
-            out = model.generate((x, lens), task="transcribe")
-            hyps.extend(out["hypotheses"])
-            refs.extend(texts)
+            hyps.extend(backend.decode(model, bdict))
+            refs.extend(bdict["raw_texts"])
         except Exception as e:
             log.warning("decode val falló: %s", e)
 
@@ -722,9 +954,11 @@ def normalize_text(s: str) -> str:
 # Main
 # ----------------------------------------------------------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Fine-tune Auden TTA ASR en español (P40)")
-    p.add_argument("--model", default="AudenAI/auden-tta-m10",
-                   help="repo HF o ruta local al modelo Auden TTA")
+    p = argparse.ArgumentParser(description="Fine-tune ASR en español (P40): Auden TTA o Whisper-medium")
+    p.add_argument("--model", choices=["auden", "whisper-medium"], default="auden",
+                   help="backend de modelo: 'auden' (AudenAI/auden-tta-m10, RNNT) "
+                        "o 'whisper-medium' (openai/whisper-medium, seq2seq CE; "
+                        "se baja la última revisión de HF Hub)")
     p.add_argument("--train-tsv", default="datasets/cv_es/train.tsv")
     p.add_argument("--test-tsv", default="datasets/cv_es/test.tsv")
     p.add_argument("--clips-dir", default="datasets/cv_es/clips")
@@ -789,7 +1023,15 @@ def parse_args():
     p.add_argument("--wandb-run-name", default="")
     # congelado
     p.add_argument("--no-freeze-branches", action="store_true",
-                   help="no congelar text_encoder/attention_decoder/align")
+                   help="no congelar text_encoder/attention_decoder/align (auden)")
+    # whisper-only
+    p.add_argument("--whisper-unfreeze-encoder", action="store_true",
+                   help="no congelar el encoder de Whisper (full fine-tune; "
+                        "por defecto el encoder queda congelado, Vividh-ASR/Gumbel-BEARD)")
+    p.add_argument("--whisper-language", default="es",
+                   help="idioma pasado a whisper.generate (default 'es')")
+    p.add_argument("--whisper-task", default="transcribe",
+                   help="tarea para whisper.generate (default 'transcribe')")
     return p.parse_args()
 
 
@@ -821,30 +1063,34 @@ def main():
     else:
         os.environ.setdefault("WANDB_MODE", "disabled")
 
-    # ---- modelo ----
-    log.info("Cargando modelo %s ...", args.model)
-    from auden.auto.auto_model import AutoModel
-
-    model = AutoModel.from_pretrained(args.model, map_location="cpu")
-    model = model.to(device)
+    # ---- modelo + backend (auden RNNT | whisper-medium seq2seq) ----
+    backend = build_backend(args, device)
+    model = backend.load(device)
     model.train()
 
-    # ---- congelar ramas no-ASR ----
-    if not args.no_freeze_branches:
-        for branch in ["text_encoder", "attention_decoder"]:
-            mod = getattr(model, branch, None)
-            if mod is not None:
-                for p_ in mod.parameters():
-                    p_.requires_grad = False
-                log.info("Congelado: %s", branch)
-        # heads de align (parámetros sueltos)
-        for nm, p_ in model.named_parameters():
-            if "align" in nm or "s2t" in nm:
-                p_.requires_grad = False
-        trainable = sum(p_.numel() for p_ in model.parameters() if p_.requires_grad)
-        total = sum(p_.numel() for p_ in model.parameters())
-        log.info("Params: %s/%s (%.1f%%)", f"{trainable/1e6:.1f}M", f"{total/1e6:.1f}M",
-                 100 * trainable / max(1, total))
+    # ---- congelar (auden: ramas no-ASR; whisper: encoder por defecto) ----
+    backend.freeze()
+    trainable, total = backend.trainable_stats(model)
+    log.info("Params: %s/%s (%.1f%%)", f"{trainable/1e6:.1f}M", f"{total/1e6:.1f}M",
+             100 * trainable / max(1, total))
+
+    # warn sobre flags RNNT-only ignorados en whisper
+    if args.model == "whisper-medium":
+        ignored = []
+        if args.rnnt_warm_step != 2000:
+            ignored.append("--rnnt-warm-step")
+        if args.simple_loss_scale != 0.5:
+            ignored.append("--simple-loss-scale")
+        if args.prune_range != 5:
+            ignored.append("--prune-range")
+        if args.am_scale != 0.0:
+            ignored.append("--am-scale")
+        if args.lm_scale != 0.25:
+            ignored.append("--lm-scale")
+        if args.no_freeze_branches:
+            ignored.append("--no-freeze-branches (auden-only)")
+        if ignored:
+            log.warning("Whisper: ignorados flags RNNT/auden-only: %s", ", ".join(ignored))
 
     # ---- dtype NS: fp32 en P40 (sm<80) ----
     ns_dtype = torch.float32
@@ -875,10 +1121,7 @@ def main():
         return {"lr_halvings": lr_halvings, "rollbacks": rollbacks,
                 "grad_tracker": tracker.state()}
 
-    # ---- feature extractor ----
-    fbank = FbankExtractor()
-
-    # ---- datasets ----
+    # ---- datasets (CVesDataset es común; el backend decide features) ----
     train_ds = CVesDataset(
         args.train_tsv, args.clips_dir, args.durations,
         16000, args.max_duration,
@@ -971,20 +1214,14 @@ def main():
             for batch_idx in window:
                 batch = [train_ds[j] for j in batch_idx]
                 try:
-                    x, lens, texts = collate(batch, fbank)
+                    bdict = backend.prepare_batch(batch, device, normalize=True)
                 except Exception as e:
                     log.warning("collate falló: %s", e)
                     skip = True
                     break
-                micros.append((x, lens, texts, len(batch_idx)))
+                micros.append(bdict)
             if skip or not micros:
                 continue
-            micros = [
-                (x.to(device, non_blocking=True),
-                 lens.to(device, non_blocking=True),
-                 [normalize_text(t) for t in texts], bs)
-                for x, lens, texts, bs in micros
-            ]
 
             # ---- intentos con protección inf/nan (misma ventana hasta éxito) ----
             skip_window = False
@@ -995,18 +1232,10 @@ def main():
                 bad_loss = False
                 loss_sum = simple_sum = pruned_sum = 0.0
                 nf_total = bs_total = 0
-                for x, lens, texts, bs in micros:
-                    outputs = model(
-                        x=x, x_lens=lens, source_texts=texts, target_texts=texts,
-                        prune_range=args.prune_range, am_scale=args.am_scale,
-                        lm_scale=args.lm_scale,
-                        forward_attention_decoder=False, forward_s2t_alignment=False,
-                        return_dict=True,
+                for bdict in micros:
+                    loss, simple, pruned, s_scale, p_scale, nf = backend.forward_loss(
+                        model, bdict, step, args
                     )
-                    loss, simple, pruned, s_scale, p_scale = compute_loss(
-                        outputs, step, args.rnnt_warm_step, args.simple_loss_scale
-                    )
-                    nf = (lens // 4).sum().item()
                     if not torch.isfinite(loss).all().item():
                         bad_loss = True
                         log.warning("step %d: loss no finita (%.4g), ventana descartada",
@@ -1018,7 +1247,7 @@ def main():
                     simple_sum += float(simple.item()) / max(1, nf)
                     pruned_sum += float(pruned.item()) / max(1, nf)
                     nf_total += nf
-                    bs_total += bs
+                    bs_total += bdict["bs"]
 
                 if bad_loss:
                     grad_bad, bad_name = True, "loss"
@@ -1173,7 +1402,7 @@ def main():
             # ---- validación + best ----
             if step % args.val_every == 0:
                 vloss, wer = validate(
-                    model, val_ds, fbank, device, args.val_samples, args.batch_seconds
+                    model, backend, val_ds, device, args.val_samples, args.batch_seconds
                 )
                 val_log.log({"step": step, "val_loss": vloss, "wer": wer})
                 if wandb_run:
@@ -1184,7 +1413,7 @@ def main():
                     bp = ckpt_dir / f"best_step-{step:07d}_wer-{wer:.4f}.pt"
                     save_checkpoint(bp, model, optimizers, scheduler, step, best_wer,
                                     args, extra=_extra_state())
-                    save_model_export(out_dir / "best_model", model)
+                    backend.export(out_dir / "best_model")
                     manage_best3(ckpt_dir, bp, wer)
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -1193,7 +1422,7 @@ def main():
     final_path = ckpt_dir / f"final_step-{step:07d}.pt"
     save_checkpoint(final_path, model, optimizers, scheduler, step, best_wer,
                     args, extra=_extra_state())
-    save_model_export(out_dir / "final_model", model)
+    backend.export(out_dir / "final_model")
     train_log.close()
     val_log.close()
     if wandb_run:

@@ -30,32 +30,46 @@ WANDB_ARGS=""
 # parsear flags propios pasados al script
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --wandb) WANDB_ARGS="--wandb"; shift ;;
-        --optimizer) WANDB_ARGS="$WANDB_ARGS --optimizer $2"; shift 2 ;;
+        --wandb) WANDB_ARGS="$WANDB_ARGS --wandb"; shift ;;
+        --optimizer) OPTIMIZER="$2"; shift 2 ;;
+        --model) MODEL="$2"; shift 2 ;;
         --help|-h)
             cat <<'EOF'
-start.sh — Fine-tuning ASR en español sobre Auden TTA m10 (P40)
+start.sh — Fine-tuning ASR en español sobre Auden TTA m10 o Whisper-medium (P40)
 
 Uso:
-  ./start.sh [--wandb] [--optimizer adamw] [ARGS de trainer.py]
+  ./start.sh                                # auden + turbo_muon, sin wandb
+  ./start.sh --model whisper-medium         # whisper-medium (encoder congelado)
+  ./start.sh --model whisper-medium --wandb
+  ./start.sh --model auden --optimizer adamw
+  ./start.sh --help
+
+Modelo:
+  --model          auden (default) | whisper-medium
+                       auden:          AudenAI/auden-tta-m10 (Zipformer+RNNT, 0.4B)
+                       whisper-medium: openai/whisper-medium (seq2seq CE, 769M);
+                                       se baja la última revisión de HF Hub.
+                                       Encoder congelado por defecto (Vividh-ASR/
+                                       Gumbel-BEARD); usar --whisper-unfreeze-encoder
+                                       para full fine-tune.
 
 Los parámetros por defecto provienen de trainer.py (defaults de argparse):
 
 Modelo / datos:
-  --model            AudenAI/auden-tta-m10
+  --model            auden          (auden | whisper-medium)
   --train-tsv        datasets/cv_es/train.tsv
   --test-tsv         datasets/cv_es/test.tsv
   --clips-dir        datasets/cv_es/clips
   --durations        datasets/cv_es/clip_durations.tsv
-  --output-dir       exp/es-asr
-  --resume           ""            (ruta de checkpoint; auto-resume si está vacío)
+  --output-dir       exp/es-asr     (auden) | exp/es-whisper-medium (whisper)
+  --resume           ""             (ruta de checkpoint; auto-resume si está vacío)
   --seed             42
-  --batch-seconds    120.0         segundos de audio por batch
+  --batch-seconds    120.0          segundos de audio por batch
   --max-duration     30.0
   --num-workers      4
 
 Entrenamiento
-  --optimizer        turbo_muon    (turbo_muon | adamw)
+  --optimizer        turbo_muon    (turbo_muon | adamw; aplicable a ambos modelos)
   --lr-muon          2e-3
   --lr-adamw         3e-4
   --weight-decay     0.01
@@ -78,12 +92,17 @@ Spike guard (z-score del grad norm, estilo ZClip)
   --max-rollbacks    5            (rollbacks antes del stop de emergencia)
   --snapshot-every   10           (frecuencia del snapshot 'last known good')
 
-RNNT / decodificación
+RNNT / decodificación (auden-only; ignorados en whisper-medium)
   --rnnt-warm-step   2000
   --simple-loss-scale 0.5
   --prune-range       5
   --am-scale          0.0
   --lm-scale          0.25
+
+Whisper-medium only
+  --whisper-unfreeze-encoder      (full fine-tune; por defecto encoder congelado)
+  --whisper-language    es        (idioma para generate)
+  --whisper-task         transcribe
 
 Checkpoints / validación
   --rolling-every    500
@@ -98,7 +117,7 @@ wandb
   --wandb-run-name  ""            (nombre del run, opcional)
 
 Congelado
-  --no-freeze-branches           (no congelar text_encoder/attention_decoder/align)
+  --no-freeze-branches           (auden: no congelar text_encoder/attention_decoder/align)
 
 Conveniencia: ARGS="--max-steps 50000" ./start.sh pasa flags extra.
 EOF
@@ -110,16 +129,27 @@ done
 
 cd "$REPO_DIR"
 
+MODEL="${MODEL:-auden}"
+OPTIMIZER="${OPTIMIZER:-turbo_muon}"
+
+# output-dir por defecto depende del modelo (se puede sobreescribir con --output-dir)
+if [[ "$MODEL" == "whisper-medium" ]]; then
+    DEFAULT_OUT="exp/es-whisper-medium"
+else
+    DEFAULT_OUT="exp/es-asr"
+fi
+
 echo "==> Entorno: $ENV_NAME | GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
-echo "==> Optimizador: ${OPTIMIZER:-turbo_muon}"
+echo "==> Modelo: $MODEL | Optimizador: $OPTIMIZER"
 echo "==> Extras: $EXTRA_ARGS $WANDB_ARGS"
 
 python trainer.py \
+    --model "$MODEL" \
     --train-tsv datasets/cv_es/train.tsv \
     --test-tsv  datasets/cv_es/test.tsv \
     --clips-dir datasets/cv_es/clips \
     --durations datasets/cv_es/clip_durations.tsv \
-    --output-dir exp/es-asr \
-    --optimizer turbo_muon \
+    --output-dir "$DEFAULT_OUT" \
+    --optimizer "$OPTIMIZER" \
     $WANDB_ARGS \
     $EXTRA_ARGS
