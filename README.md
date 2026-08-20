@@ -341,6 +341,8 @@ tail -f exp/es-asr/train_log.csv          # o exp/es-whisper-medium/train_log.cs
 # https://wandb.ai/<tu-usuario>/auden-asr-es
 ```
 
+> Para un análisis de los runs de W&B (aciertos, fallas y evolución de hiperparámetros) cruzados con los commits del repo, ver [`Experimentos.md`](Experimentos.md).
+
 ---
 
 ## 12. Resolución de problemas
